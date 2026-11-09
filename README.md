@@ -57,6 +57,18 @@ Client client.js                        ▼
 
 ## 安装
 
+### 方式 0：从本仓库克隆后安装
+
+```bash
+git clone https://github.com/supergameboy/DSH-agents-md-every-turn.git
+```
+
+```
+plugin_manager { action: "install_bundle", target: "<克隆下来的目录绝对路径>" }
+```
+
+克隆目录要保留，删除后插件失效（见方式 B）。
+
 ### 方式 A：从 tarball 安装（推荐）
 
 `npm pack` 产出的 `.tgz`，文件清单由 `package.json` 的 `files` 决定。
