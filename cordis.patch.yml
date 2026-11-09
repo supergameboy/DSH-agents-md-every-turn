@@ -4,13 +4,20 @@
       config:
         modelPattern: deepseek
         cadence: turn
+        # Explicit sources, delivered before the discovered project chain.
         paths:
           - '~/.dsh/AGENTS.md'
           - '~/.agents/AGENTS.md'
-          - 'AGENTS.md'
         maxBytes: 65536
+        # Climb from the Session directory to the project root and deliver
+        # every candidate file from the root down to the Session directory.
+        discover: true
+        instructionFileCandidates:
+          - AGENTS.md
+        projectRootMarkers:
+          - .git
         interactionTools:
-          - 'ask_user_question'
+          - ask_user_question
           - '*question*'
         injectAfterApproval: true
         injectAfterUserInput: true

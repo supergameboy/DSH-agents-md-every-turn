@@ -18,7 +18,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 /**
  * Service dependencies, kept for readiness ordering. Runtime reads go through
@@ -36,8 +36,18 @@ const SOURCE_KIND = 'agents-md-every-turn'
 /** Default substring matched against `<provider>/<model>`; empty matches every model. */
 const DEFAULT_MODEL_PATTERN = 'deepseek'
 
-/** Instruction sources in delivery order; relative entries resolve against the Session directory. */
-const DEFAULT_PATHS = ['~/.dsh/AGENTS.md', '~/.agents/AGENTS.md', 'AGENTS.md']
+/**
+ * Explicit instruction sources delivered before the project chain. Relative
+ * entries resolve against the Session directory; the project chain below the
+ * Session directory is discovered separately, so it is not listed here.
+ */
+const DEFAULT_PATHS = ['~/.dsh/AGENTS.md', '~/.agents/AGENTS.md']
+
+/** Candidate file names loaded from each directory of a discovered project chain. */
+const DEFAULT_INSTRUCTION_FILE_CANDIDATES = ['AGENTS.md']
+
+/** Directory entries whose presence marks a project root while climbing upward. */
+const DEFAULT_PROJECT_ROOT_MARKERS = ['.git']
 
 /** Byte budget for one injected batch, matching the harness baseline budget. */
 const DEFAULT_MAX_BYTES = 65536
@@ -66,12 +76,17 @@ const INTRO = [
  * Normalize one row's config into the values read on every turn.
  * @param {unknown} config - the Loader row's `config` value.
  * @returns {{modelPattern: string, cadence: 'turn' | 'step', paths: string[], maxBytes: number,
- *   interactionTools: string[], injectAfterApproval: boolean, injectAfterUserInput: boolean}}
+ *   interactionTools: string[], injectAfterApproval: boolean, injectAfterUserInput: boolean,
+ *   discover: boolean, instructionFileCandidates: string[], projectRootMarkers: string[]}}
  */
 function readSettings(config) {
   const raw = config ?? {}
   const configured = Array.isArray(raw.paths) ? raw.paths.filter(isNonEmptyString) : []
   const tools = Array.isArray(raw.interactionTools) ? raw.interactionTools.filter(isNonEmptyString) : []
+  const candidates = Array.isArray(raw.instructionFileCandidates)
+    ? raw.instructionFileCandidates.filter(isNonEmptyString)
+    : []
+  const markers = Array.isArray(raw.projectRootMarkers) ? raw.projectRootMarkers.filter(isNonEmptyString) : []
   return {
     modelPattern: typeof raw.modelPattern === 'string' ? raw.modelPattern.trim() : DEFAULT_MODEL_PATTERN,
     cadence: raw.cadence === 'step' ? 'step' : 'turn',
@@ -80,6 +95,9 @@ function readSettings(config) {
     interactionTools: tools.length > 0 ? tools : DEFAULT_INTERACTION_TOOLS,
     injectAfterApproval: raw.injectAfterApproval !== false,
     injectAfterUserInput: raw.injectAfterUserInput !== false,
+    discover: raw.discover !== false,
+    instructionFileCandidates: candidates.length > 0 ? candidates : DEFAULT_INSTRUCTION_FILE_CANDIDATES,
+    projectRootMarkers: markers.length > 0 ? markers : DEFAULT_PROJECT_ROOT_MARKERS,
   }
 }
 
@@ -189,6 +207,71 @@ function expandSourcePath(source, cwd) {
 }
 
 /**
+ * Test whether one directory carries a configured project-root marker.
+ * A marker we cannot stat is treated as absent rather than as a match, so a
+ * permission failure cannot silently select an ancestor as the project root.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} directory - absolute candidate directory.
+ * @param {readonly string[]} markers - marker entry names.
+ * @returns {Promise<boolean>}
+ */
+async function hasProjectMarker(ctx, directory, markers) {
+  const fs = ctx.get('fs')
+  if (fs === undefined) return false
+  for (const marker of markers) {
+    try {
+      const info = await fs.lstat(join(directory, marker))
+      if (info !== undefined) return true
+    } catch (_probeFailure) {
+      // Absent or unreadable: keep climbing.
+    }
+  }
+  return false
+}
+
+/**
+ * Resolve the project instruction chain for one Session directory: every
+ * directory from the project root down to the Session directory, broad to
+ * specific, contributes its candidate file names. The project root is the
+ * highest directory reachable upward that carries a configured marker; when
+ * none is found, only the Session directory itself contributes, so climbing
+ * never turns into "read AGENTS.md from the drive root".
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string | undefined} cwd - the Session's effective directory.
+ * @param {{discover: boolean, instructionFileCandidates: readonly string[], projectRootMarkers: readonly string[]}} settings
+ * @returns {Promise<string[]>} absolute candidate paths, broad to specific.
+ */
+async function discoverInstructionSources(ctx, cwd, settings) {
+  if (cwd === undefined || !settings.discover) return []
+  const candidates = settings.instructionFileCandidates
+  if (candidates.length === 0) return []
+
+  // visited[0] is the Session directory; higher indexes are ancestors.
+  const visited = [cwd]
+  let current = cwd
+  while (true) {
+    const parent = dirname(current)
+    if (parent === current || parent.length === 0) break
+    current = parent
+    visited.push(current)
+  }
+
+  let rootIndex = 0
+  for (let index = 0; index < visited.length; index += 1) {
+    if (await hasProjectMarker(ctx, visited[index], settings.projectRootMarkers)) {
+      rootIndex = index
+      break
+    }
+  }
+
+  const sources = []
+  for (let index = rootIndex; index >= 0; index -= 1) {
+    for (const name of candidates) sources.push(join(visited[index], name))
+  }
+  return sources
+}
+
+/**
  * Read the Session's effective working directory.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{id: string}} agent
@@ -260,13 +343,28 @@ function truncateToBytes(text, maxBytes) {
  */
 async function composeInstructionMessage(ctx, agent, settings, record) {
   const cwd = sessionDirectory(ctx, agent)
+
+  // Broad to specific: explicit sources first, then the discovered project
+  // chain from its root down to the Session directory.
+  const ordered = []
+  for (const source of settings.paths) {
+    const path = expandSourcePath(source, cwd)
+    if (path !== undefined) ordered.push(path)
+  }
+  for (const path of await discoverInstructionSources(ctx, cwd, settings)) ordered.push(path)
+
   const sections = []
+  const seenPaths = new Set()
+  const seenBodies = new Set()
   let remaining = settings.maxBytes
   let truncated = false
 
-  for (const source of settings.paths) {
-    const path = expandSourcePath(source, cwd)
-    if (path === undefined) continue
+  for (const path of ordered) {
+    // The same file can be named by an explicit source and by the chain, and a
+    // CLAUDE.md may duplicate its AGENTS.md; neither is delivered twice.
+    const identity = path.toLowerCase()
+    if (seenPaths.has(identity)) continue
+    seenPaths.add(identity)
 
     const read = await readInstructionFile(ctx, path, record)
     if (read.kind === 'absent') continue
@@ -275,8 +373,14 @@ async function composeInstructionMessage(ctx, agent, settings, record) {
       continue
     }
 
-    const escaped = read.text.replace(CLOSING_FRAME, '<\\/system-reminder>')
-    const budgeted = truncateToBytes(escaped, remaining)
+    const body = read.text.trim()
+    if (body.length === 0) continue
+    const escape = (text) => text.replace(CLOSING_FRAME, '<\\/system-reminder>')
+    const digest = escape(body)
+    if (seenBodies.has(digest)) continue
+    seenBodies.add(digest)
+
+    const budgeted = truncateToBytes(digest, remaining)
     sections.push(`Instructions from: ${path}\n\n${budgeted.text}`)
     remaining -= Buffer.byteLength(budgeted.text, 'utf8')
     if (budgeted.truncated) {

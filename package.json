@@ -1,6 +1,6 @@
 {
   "name": "@local/agents-md-every-turn",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Re-delivers the workspace AGENTS.md instructions at the start of every turn while the Session model matches a pattern (DeepSeek by default), and shows the injection count below the composer.",
   "type": "module",

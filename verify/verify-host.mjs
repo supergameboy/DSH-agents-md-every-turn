@@ -8,14 +8,12 @@
  * rendering, framing and byte budget are all exercised through the same code
  * the Host loads.
  */
-import { readFile, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const PLUGIN = pathToFileURL(
-  'C:/Users/01/Documents/deepseek-harness/default-workspace/dsh-plugins/agents-md-every-turn/index.js',
-)
+const PLUGIN = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.js'))
 const mod = await import(PLUGIN)
 const { apply, inject } = mod
 
@@ -29,12 +27,18 @@ function check(name, ok, detail) {
   console.log(`FAIL  ${name}${detail === undefined ? '' : ` :: ${detail}`}`)
 }
 
-/** Build a fake Host context that records listeners and the projection unit. */
-async function createHost(config) {
+/**
+ * Build a fake Host context that records listeners and the projection unit.
+ * @param {unknown} config - plugin config.
+ * @param {string} [cwd] - the fake Session's effective working directory.
+ */
+async function createHost(config, cwd = process.cwd()) {
   const listeners = new Map()
   const services = {
     sessions: {
-      get: (id) => (id === 'session-a' || id === 'session-b' ? { id, header: { cwd: process.cwd() } } : undefined),
+      get: (id) => (id === 'session-a' || id === 'session-b' || id === 'session-c'
+        ? { id, header: { cwd } }
+        : undefined),
     },
     workingDirectory: { get: (session) => session.header.cwd },
     fs: {
@@ -289,6 +293,58 @@ function completeCall(listeners, sessionId, callId, toolName) {
     listeners.get('session/event')({ id: 'session-a' }, { type: 'user/message' })
   } catch { threw = true }
   check('malformed session events are contained', threw === false)
+}
+
+// --- Project-chain discovery from the Session directory --------------------
+{
+  const fixture = await mkdtemp(join(tmpdir(), 'amd-fixture-'))
+  const nowhere = join(fixture, 'no-such-file.md')
+  // A marked project: root AGENTS.md plus a nested one, broad to specific.
+  const project = join(fixture, 'proj')
+  await mkdir(join(project, '.git'), { recursive: true })
+  await writeFile(join(project, 'AGENTS.md'), 'ROOT-RULE-ONLY', 'utf8')
+  await mkdir(join(project, 'packages', 'app'), { recursive: true })
+  await writeFile(join(project, 'packages', 'app', 'AGENTS.md'), 'APP-RULE-ONLY', 'utf8')
+  // An unmarked directory: only its own file may contribute.
+  const loose = join(fixture, 'loose')
+  await mkdir(loose, { recursive: true })
+  await writeFile(join(loose, 'AGENTS.md'), 'LOOSE-RULE-ONLY', 'utf8')
+  // A project whose two levels carry identical content.
+  const dup = join(fixture, 'dup')
+  await mkdir(join(dup, '.git'), { recursive: true })
+  await writeFile(join(dup, 'AGENTS.md'), 'SAME-RULE-EVERYWHERE', 'utf8')
+  await mkdir(join(dup, 'sub'), { recursive: true })
+  await writeFile(join(dup, 'sub', 'AGENTS.md'), 'SAME-RULE-EVERYWHERE', 'utf8')
+
+  /** Read the injected text for one fake Session anchored at `cwd`. */
+  async function injectAt(cwd, config = { paths: [nowhere] }) {
+    const { listeners } = await createHost(config, cwd)
+    const decision = await runStep(listeners, { agentId: 'session-c', turn: 1, step: 1, provider: 'deepseek', model: 'deepseek-chat' })
+    return decision.messages.length === 2 ? decision.messages.at(-1).content[0].text : ''
+  }
+
+  const nested = await injectAt(join(project, 'packages', 'app'))
+  check('discovers the project root above the Session directory', nested.includes('ROOT-RULE-ONLY'))
+  check('includes the Session directory own file', nested.includes('APP-RULE-ONLY'))
+  check('delivers broad before specific', nested.indexOf('ROOT-RULE-ONLY') < nested.indexOf('APP-RULE-ONLY'))
+
+  const unmarked = await injectAt(loose)
+  check('an unmarked tree contributes only the Session directory', unmarked.includes('LOOSE-RULE-ONLY'))
+  check('an unmarked tree does not climb into unrelated directories', (unmarked.match(/Instructions from:/g) ?? []).length === 1)
+
+  const duplicated = await injectAt(join(dup, 'sub'))
+  check('identical content is delivered once', (duplicated.match(/SAME-RULE-EVERYWHERE/g) ?? []).length === 1)
+
+  const disabled = await injectAt(join(project, 'packages', 'app'), { paths: [nowhere], discover: false })
+  check('discover:false disables the chain entirely', disabled === '')
+
+  const customCandidate = await injectAt(join(project, 'packages', 'app'), {
+    paths: [nowhere],
+    instructionFileCandidates: ['AGENTS.md', 'CLAUDE.md'],
+  })
+  check('candidate names stay configurable', customCandidate.includes('ROOT-RULE-ONLY'))
+
+  await rm(fixture, { recursive: true, force: true })
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

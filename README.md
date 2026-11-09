@@ -17,7 +17,12 @@
   3. **审批结论** —— 日志出现 `approval/decided` 后注入（`injectAfterApproval`）。
   4. **轮内用户插话** —— 同一轮内出现来源为 `user` 的 `user/message`（steering / 排队消息进入本轮）后注入（`injectAfterUserInput`）。
 - **去重**：交互信号只置一次性标志，由下一次 `agent/pre-step` 消费后立即清除，因此同一步绝不重复注入；插件自己注入的消息来源是 `agents-md-every-turn`，不会被误判为用户交互。
-- **文件源**：默认 `~/.dsh/AGENTS.md`、`~/.agents/AGENTS.md`、会话 cwd 下 `AGENTS.md`（存在的才注入）。每条以 `<system-reminder>` 包裹并标注来源路径；正文里的字面 `</system-reminder>` 会被转义；按 `maxBytes` 截断并给出预算提示。
+- **文件源**（宽 → 窄，按顺序拼接）：
+  1. `paths` 里的显式来源，默认 `~/.dsh/AGENTS.md`、`~/.agents/AGENTS.md`；`~` 指用户主目录，绝对路径原样，相对路径按**会话当前工作目录**解析。
+  2. **项目链**：从会话当前工作目录向上找到带 `projectRootMarkers`（默认 `.git`）的项目根，再把根到当前目录沿途每层的 `instructionFileCandidates`（默认 `AGENTS.md`）全部收入。向上找不到标记时只取会话目录本身，不会一路爬到盘符根。
+  3. 同一路径只注入一次；不同路径但**内容相同**也只注入一次（`CLAUDE.md` 复制 `AGENTS.md` 时不会重复）。空的文件跳过。
+- **动态读取**：每次注入前先 `lstat` 比对文件版本，只有变了才真正重读。所以改 `AGENTS.md` 后**无需重启插件**，下一次注入即生效。整个链路通过 `ctx.fs` 读取，跟随 DSH 的执行世界而非裸主机路径。
+- 每条以 `<system-reminder>` 包裹并标注来源路径；正文里的字面 `</system-reminder>` 会被转义；按 `maxBytes` 截断并给出预算提示。
 - **消息形态**：带 `source.kind: 'agents-md-every-turn'` 的普通 `user/message` 事件，进入会话日志，可回放、续会话、fork、压缩。
 - **计数**：Host 侧 `sessionProjections` 单元 `agentsMdInjections`，纯同步 fold `user/message` 事件按上述 source 计数，`wire.view` 输出整数。Client 侧 `conversation.composer.dock` 的组件用 slot props 的 `useProjection('agentsMdInjections')` 读取并订阅。计数不是内存状态，重启/续会话/fork 后从日志重建。
 
@@ -31,6 +36,9 @@
 | `cadence` | `turn` | `turn` 每轮一次 / `step` 每步一次 |
 | `paths` | 见上 | 指令文件路径，支持 `~`、绝对路径、相对会话 cwd |
 | `maxBytes` | `65536` | 单条注入的 UTF-8 字节预算 |
+| `discover` | `true` | 是否从会话目录向上发现项目链 |
+| `instructionFileCandidates` | `['AGENTS.md']` | 每层目录里要加载的文件名 |
+| `projectRootMarkers` | `['.git']` | 标记项目根的目录项名 |
 | `interactionTools` | `['ask_user_question', '*question*']` | 视为「需要用户回答」的工具名；含 `*` 的条目按通配、忽略大小写匹配 |
 | `injectAfterApproval` | `true` | 审批结论（`approval/decided`）后是否补注入 |
 | `injectAfterUserInput` | `true` | 轮内用户插话（来源为 `user` 的消息）后是否补注入 |
@@ -56,6 +64,9 @@ Client client.js                        ▼
 - **交互后的注入是「全文」**：按你的选择，每次都送完整指令，不再区分精简模式。
 - **`approval/decided` 依赖 `ask` 策略**：会话策略为 `never` 时审批请求被确定性拒绝、不产生人工交互，因此该触发不会命中；这类会话的日志里只会出现 `approval/policy`。
 - **计数只统计注入**：交互触发注入同样计入徽标，因此徽标数字会随交互次数明显增长。
+- **项目链发现只认显式标记**：向上攀爬靠 `projectRootMarkers` 判定，找不到标记时只取会话目录本身，不会把盘符根当成项目根。若你的仓库没有 `.git`，请把标记改成实际存在的目录项（如 `.hg`、`pnpm-workspace.yaml`），或在 `paths` 里直接写相对路径。
+- **不读 `*.local.md` overlay**：内置 `dsh-agent-instructions` 会加载 `AGENTS.local.md` / `CLAUDE.local.md` 覆盖层，本插件只按 `instructionFileCandidates` 列出的名字读取。需要覆盖层就把它加进这个列表。
+- **项目链不带字节预算分层**：整批共享一个 `maxBytes`，超出即截断并提示，不像内置实现那样对全局链和项目链分别计价。
 
 ## 安装
 
@@ -107,7 +118,7 @@ node verify/verify-host.mjs     # Host 侧：注入逻辑、交互触发、计�
 node verify/verify-client.mjs   # Client 侧：composer.dock 组件的取值与渲染
 ```
 
-覆盖范围包括：模型匹配、轮次与交互两路触发、一次性标志、通配工具名、审批与插话信号、自身注入不误判、非匹配模型全部静默、畸形事件不外溢、字节预算截断、以及计数 fold 的引用不变性。
+覆盖范围包括：模型匹配、轮次与交互两路触发、一次性标志、通配工具名、审批与插话信号、自身注入不误判、非匹配模型全部静默、畸形事件不外溢、字节预算截断、计数 fold 的引用不变性，以及**项目链向上发现**（找到仓库根、宽→窄排序、无标记时不乱爬、相同内容去重、`discover:false` 关闭、候选文件名可配置）。测试用临时目录构造真实的多层 `AGENTS.md` 结构，不是打桩假设。
 
 真实日志取证（确认信号链路而非纯单元假设）：会话日志中 `tool/call` 携带 `{turn, step, callId, name, arguments}`，`tool/result` 携带 `message.toolCallId`，两者可按 callId 配对；`agentsMdInjections` projection 的取值与日志中实际注入的批次数严格一致。
 
