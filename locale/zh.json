@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Agents.md 每轮注入",
+    "description": "当会话当前模型命中 DeepSeek 时，在每轮开始以及任何用户交互（提问、审批、插话）结束后重新注入 AGENTS.md 指令文件。"
+  }
+}

@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+# Keep binary artifacts untouched.
+*.png binary
+*.jpg binary
+*.webp binary
+*.tgz binary
+*.zip binary

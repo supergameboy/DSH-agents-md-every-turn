@@ -1,0 +1,13 @@
+# Build artifacts: attach these to a GitHub Release instead of committing them.
+dist/
+*.tgz
+*.zip
+
+# Package managers
+node_modules/
+pnpm-lock.yaml
+
+# OS noise
+Thumbs.db
+.DS_Store
+desktop.ini

@@ -1,0 +1,16 @@
+- insert:
+    - id: agents-md-every-turn
+      name: '@local/agents-md-every-turn'
+      config:
+        modelPattern: deepseek
+        cadence: turn
+        paths:
+          - '~/.dsh/AGENTS.md'
+          - '~/.agents/AGENTS.md'
+          - 'AGENTS.md'
+        maxBytes: 65536
+        interactionTools:
+          - 'ask_user_question'
+          - '*question*'
+        injectAfterApproval: true
+        injectAfterUserInput: true

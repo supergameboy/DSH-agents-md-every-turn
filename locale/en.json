@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Agents.md every turn",
+    "description": "Re-delivers the AGENTS.md instruction files whenever a turn starts or a user interaction resolves (question, approval, steering) while the Session model matches DeepSeek."
+  }
+}
